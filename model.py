@@ -163,6 +163,7 @@ class DelayedSelfAttention(nn.Module):
 
 
     def forward(self, e1, e2):
+        print("!!! DEBUG: INITIALIZING DELAYED LAYER !!!")
         B, T, C = e1.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         x = torch.cat([e1, e2], dim=1)
