@@ -1,19 +1,44 @@
 """
-Full definition of a GPT Language Model, all of it in this single file.
-References:
-1) the official GPT-2 TensorFlow implementation released by OpenAI:
-https://github.com/openai/gpt-2/blob/master/src/model.py
-2) huggingface/transformers PyTorch implementation:
-https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
+Left to do:
+
+1. FlexAttention kernel to optimize delayed attention (to lower delayed attention compute from 4n^2 to 2n^2)
+2. Make sure gradients are stable during training
+    Scale initialized parameters properly to normalize variance (since I am adding more parameters)
+    Should I initialize wete to zero?
+    Possibly change where I do RMSNorm
+    Have E1/E2 embedding stream balancing
+    QK normalization
+4. LoRA heads for MLP and projection matrices for E2 embeddings
+5. Cascade Attention
+6. estimate_flops function (can track memory empirically)
+7. (more advanced) Auxillary loss (make E2 predict something) --> If there are current issues
+
+
+General GPT improvements (might move to nanoChat for this):
+
+1. Clean up biases and orderings
+2. RMSNorm
+3. SwiGLU
+4. RoPE (and YaRN)
+5. MLA or GQA
+6. Muon
+7. Optional: Sliding window attention
+8. Optional: MoE
+
 """
+
 
 import math
 import inspect
 from dataclasses import dataclass
+from dataclasses import field
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+
+# from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -25,6 +50,8 @@ class LayerNorm(nn.Module):
 
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+
+
 
 class CausalSelfAttention(nn.Module):
 
@@ -75,6 +102,119 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y
 
+
+
+
+
+
+class DelayedSelfAttention(nn.Module):
+
+    # NEED TO IMPLEMENT, RIGHT NOW IS A COPY OF CausalSelfAttention()
+    # Current approach: Masked Concatention. Compute: 4n^2.
+    # Future: Custom Lernel, 2n^2 compute
+
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        # key, query, value projections for all heads, but in a batch
+        # sharing projection parameters for E1 and E2
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        # output projection
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        # regularization
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
+
+        self.lookahead = config.lookahead
+        self.overlap = config.overlap
+
+
+        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        if not self.flash:
+            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+        
+        S = config.block_size
+        ones = torch.ones(S, S, dtype=torch.bool)
+
+        # E1 performs attention with the previous (lookahead) + (overlap) E1s
+        mask_e1_e1 = torch.tril(ones) & torch.triu(ones, diagonal=-(self.lookahead + self.overlap))
+
+        # E1 performs attention with all E2s in the past up until i - (lookahead)
+        mask_e1_e2 = torch.tril(ones, diagonal=-self.lookahead)
+
+        # E2 performs attention with the previous (overlap) and the next (lookahead) E1s
+        mask_e2_e1 = torch.tril(ones, diagonal=self.lookahead) & torch.triu(ones, diagonal=-self.overlap)
+
+        # E2 performs attention with all E2s in the past
+        mask_e2_e2 = torch.tril(ones)
+
+
+        p1 = torch.cat([mask_e1_e1, mask_e1_e2], dim=1)
+        p2 = torch.cat([mask_e2_e1, mask_e2_e2], dim=1)
+        full = torch.cat([p1, p2], dim=0)
+
+        self.register_buffer("bias", full.view(1, 1, 2*S, 2*S))
+
+
+
+
+    def forward(self, e1, e2):
+        B, T, C = e1.size() # batch size, sequence length, embedding dimensionality (n_embd)
+
+        x = torch.cat([e1, e2], dim=1)
+
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, 2*T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, 2T, hs)
+        q = q.view(B, 2*T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, 2T, hs)
+        v = v.view(B, 2*T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, 2T, hs)
+
+        S = self.bias.shape[3] // 2
+
+        e1_e1 = self.bias[:, :, :T, :T]
+        e1_e2 = self.bias[:, :, :T, S:S+T]
+        e2_e1 = self.bias[:, :, S:S+T, :T]
+        e2_e2 = self.bias[:, :, S:S+T, S:S+T]
+
+        p1 = torch.cat([e1_e1, e1_e2], dim=3)
+        p2 = torch.cat([e2_e1, e2_e2], dim=3)
+        attn_mask = torch.cat([p1, p2], dim=2)
+
+        if self.flash:
+            y = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, 
+                attn_mask=attn_mask.bool(), 
+                dropout_p=self.dropout if self.training else 0, 
+                is_causal=False
+            )
+        
+        else:
+            # manual implementation of attention
+            # IS THIS CORRECT?
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            att = att.masked_fill(attn_mask == 0, float('-inf'))
+            att = F.softmax(att, dim=-1)
+            att = self.attn_dropout(att)
+            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+
+
+        y = y.transpose(1, 2).contiguous().view(B, 2*T, C) # re-assemble all head outputs side by side
+        e1, e2 = y.split(T, dim=1)
+
+        e1 = self.resid_dropout(self.c_proj(e1))
+        e2 = self.resid_dropout(self.c_proj(e2))
+
+        return e1, e2
+
+
+
+
+
+
 class MLP(nn.Module):
 
     def __init__(self, config):
@@ -91,7 +231,11 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
+
+
 class Block(nn.Module):
+
+    # Completely ignores e2
 
     def __init__(self, config):
         super().__init__()
@@ -100,10 +244,60 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
-        return x
+    def forward(self, e1, e2):
+        e1 = e1 + self.attn(self.ln_1(e1))
+        e1 = e1 + self.mlp(self.ln_2(e1))
+        return e1, e1
+
+
+
+class DelayedBlock(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.attn = DelayedSelfAttention(config)
+        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        self.mlp = MLP(config)
+
+    def forward(self, e1, e2):
+
+        attn_out1, attn_out2 = self.attn(self.ln_1(e1), self.ln_1(e2))
+
+        e1 = e1 + attn_out1
+        e2 = e2 + attn_out2
+
+        e1 = e1 + self.mlp(self.ln_2(e1))
+        e2 = e2 + self.mlp(self.ln_2(e2))
+
+        return e1, e2
+
+
+
+class MergingDelayedBlock(nn.Module):
+
+    # For "merging" layers (going from delayed layers to standard layers):
+    # it is the exact same as standard Delayed Layers,except do not modify E2
+    # Only return two copies of E1, but still perform attention with E2
+    # Might need a specific DelayedSelfAttention() for mergine layers to save compute
+    # Or just add a flag to not compute e2
+    # Even in a fully delayed attention architecture, the final layer should be a merging layer
+
+    def __init__(self, config):
+        super().__init__()
+        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.attn = DelayedSelfAttention(config)
+        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        self.mlp = MLP(config)
+
+    def forward(self, e1, e2):
+        # will add a flag here to not compute e2
+        attn_out1, attn_out2 = self.attn(self.ln_1(e1), self.ln_1(e2))
+        e1 = e1 + attn_out1
+        e1 = e1 + self.mlp(self.ln_2(e1))
+        return e1, e1
+
+
 
 @dataclass
 class GPTConfig:
@@ -115,6 +309,12 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
 
+    # delayed attention hyperparameters:
+    delayed_layers: list = field(default_factory=list) # indices of delayed layers, empty --> standard attention
+    lookahead: int = 30
+    overlap: int = 15
+
+
 class GPT(nn.Module):
 
     def __init__(self, config):
@@ -123,13 +323,33 @@ class GPT(nn.Module):
         assert config.block_size is not None
         self.config = config
 
+        layers = []
+        embed_type_encod = {} # initialize embedding-type encodings as empty dict
+
+        for i in range(config.n_layer):
+
+            if i in config.delayed_layers and not i == config.n_layer - 1:
+
+                layers.append(DelayedBlock(config))
+
+                if i==0 or i-1 not in config.delayed_layers:
+                    embed_type_encod[str(i)] = nn.Embedding(2, config.n_embd) # add a layer of embedding-type encodings
+
+            elif i==0 or i-1 not in config.delayed_layers:
+                layers.append(Block(config))
+            else:
+                layers.append(MergingDelayedBlock(config))
+            
+
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
+            wete = nn.ModuleDict(embed_type_encod), # embedding-type encodings SHOULD THESE BE INITIALIZED TO RANDOM OR TO ZERO???
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList(layers),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
+
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
@@ -176,10 +396,23 @@ class GPT(nn.Module):
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
-            x = block(x)
-        x = self.transformer.ln_f(x)
+
+        e1 = self.transformer.drop(tok_emb + pos_emb)
+        e2 = e1
+
+        for i, block in enumerate(self.transformer.h):
+
+            # add embedding-type encodings here
+            # registering as buffer is slightly better, will keep this for readability
+            if str(i) in self.transformer.wete:
+                wete = self.transformer.wete[str(i)]
+                e1 = e1 + wete.weight[0]
+                e2 = e2 + wete.weight[1]
+
+            e1, e2 = block(e1, e2)
+
+
+        x = self.transformer.ln_f(e1)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
@@ -204,7 +437,7 @@ class GPT(nn.Module):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
 
     @classmethod
-    def from_pretrained(cls, model_type, override_args=None):
+    def from_pretrained(cls, model_type, override_args=None): # This is irrelevant for delayed / cascade attention
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
         override_args = override_args or {} # default to empty dict
         # only dropout can be overridden see more notes below
