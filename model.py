@@ -4,7 +4,7 @@ Left to do:
 1. FlexAttention kernel to optimize delayed attention (to lower delayed attention compute from 4n^2 to 2n^2)
 2. Make sure gradients are stable during training
     Scale initialized parameters properly to normalize variance (since I am adding more parameters)
-    Should I initialize wete to zero?
+    Should I initialize wete (and eventually LoRA heads) to zero?
     Possibly change where I do RMSNorm
     Have E1/E2 embedding stream balancing
     QK normalization
