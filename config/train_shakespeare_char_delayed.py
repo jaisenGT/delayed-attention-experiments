@@ -1,5 +1,5 @@
 
-# train_shakespeare_char.py:
+# train_shakespeare_char_delayed.py:
 # train a miniature character-level shakespeare model
 # good for debugging and playing on macbooks and such
 
@@ -25,6 +25,11 @@ n_layer = 6
 n_head = 6
 n_embd = 384
 dropout = 0.2
+
+# delayed attention parameters
+delayed_layers = [0, 1, 2]
+lookahead = 30
+overlap = 15
 
 
 
