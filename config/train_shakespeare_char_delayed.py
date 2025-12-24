@@ -34,8 +34,8 @@ overlap = 15
 
 
 learning_rate = 1e-3 # with baby networks can afford to go a bit higher
-max_iters = 500
-lr_decay_iters = 500 # make equal to max_iters usually
+max_iters = 2000
+lr_decay_iters = 2000 # make equal to max_iters usually
 min_lr = 1e-4 # learning_rate / 10 usually
 beta2 = 0.99 # make a bit bigger because number of tokens per iter is small
 
