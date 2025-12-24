@@ -11,13 +11,12 @@ Left to do:
 1. FlexAttention kernel to optimize delayed attention (to lower delayed attention compute from 4n^2 with current "Masked Concatenation" to 2n^2)
 2. Make sure gradients are stable during training
     Scale initialized parameters properly to normalize variance (since I am adding more parameters)
-    Should I initialize wete to zero?
-    Possibly change where I do RMSNorm
-    Have E1/E2 embedding stream balancing
+    Possibly change where I do normalization
+    E1/E2 embedding stream balancing
     QK normalization
 3. Cascade Attention
-4. estimate_flops function (can track memory empirically)
-5. auxillary loss (make E2 predict something, like token i + lookahead + 1), make it not as important as main E1 next-token loss
+4. Estimate_flops function (can track memory empirically)
+5. Auxillary loss (make E2 predict something, like token i + lookahead + 1), make it not as important as main E1 next-token loss
 6. Separate trained encodings for E1 and E2 from the start --> only works if the first layer is delayed
 
 
@@ -452,7 +451,7 @@ class GPT(nn.Module):
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
-            wete = nn.ModuleDict(embed_type_encod), # embedding-type encodings SHOULD THESE BE INITIALIZED TO RANDOM OR TO ZERO???
+            wete = nn.ModuleDict(embed_type_encod), # embedding-type encodings
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList(layers),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
@@ -468,8 +467,8 @@ class GPT(nn.Module):
         # init all weights
         self.apply(self._init_weights)
 
-        for key in self.transformer.wete:
-            nn.init.zeros_(self.transformer.wete[key].weight) # initialize enbedding-type encodings with zeros
+        # for key in self.transformer.wete:
+        #     nn.init.zeros_(self.transformer.wete[key].weight) # initialize enbedding-type encodings with zeros
 
         # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
