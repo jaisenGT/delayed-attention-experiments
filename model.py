@@ -1,8 +1,9 @@
 """
-Features:
+Additions:
 
 1. Embedding-type encodings
-2. LoRA heads for MLP and projection matrices for E2 embeddings
+2. Overlap
+3. LoRA heads for MLP and projection matrices for E2 embeddings
 
 
 Left to do:
@@ -10,7 +11,7 @@ Left to do:
 1. FlexAttention kernel to optimize delayed attention (to lower delayed attention compute from 4n^2 with current "Masked Concatenation" to 2n^2)
 2. Make sure gradients are stable during training
     Scale initialized parameters properly to normalize variance (since I am adding more parameters)
-    Should I initialize wete (and eventually LoRA heads) to zero?
+    Should I initialize wete to zero?
     Possibly change where I do RMSNorm
     Have E1/E2 embedding stream balancing
     QK normalization
@@ -57,7 +58,7 @@ class LoRA(nn.Module):
         self.lora_A = nn.Parameter(torch.zeros(in_dim, rank))
         self.lora_B = nn.Parameter(torch.zeros(rank, out_dim))
         
-        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5)) # SHOULD THIS BE INITIALIZED TO ZEROS
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
         nn.init.zeros_(self.lora_B)
 
     def forward(self, x):
@@ -194,7 +195,7 @@ class DelayedSelfAttention(nn.Module):
 
 
 
-    def forward(self, e1, e2):
+    def forward(self, e1, e2, compute_e2=True):
         B, T, C = e1.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         x = torch.cat([e1, e2], dim=1)
@@ -208,8 +209,42 @@ class DelayedSelfAttention(nn.Module):
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v  = qkv.split(self.n_embd, dim=2)
         k = k.view(B, 2*T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, 2T, hs)
-        q = q.view(B, 2*T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, 2T, hs)
         v = v.view(B, 2*T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, 2T, hs)
+
+
+        if not compute_e2:
+
+            q = q[:, :T, :] 
+            q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+            S = self.bias.shape[3] // 2
+            e1_e1 = self.bias[:, :, :T, :T]
+            e1_e2 = self.bias[:, :, :T, S:S+T]
+            attn_mask = torch.cat([e1_e1, e1_e2], dim=3)
+
+            if self.flash:
+                y = torch.nn.functional.scaled_dot_product_attention(
+                    q, k, v, 
+                    attn_mask=attn_mask.bool(), 
+                    dropout_p=self.dropout if self.training else 0, 
+                    is_causal=False
+                )
+            else:
+                # manual implementation of attention
+                att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+                att = att.masked_fill(attn_mask == 0, float('-inf'))
+                att = F.softmax(att, dim=-1)
+                att = self.attn_dropout(att)
+                y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+
+            y = y.transpose(1, 2).contiguous().view(B, T, C)
+            y_out = self.c_proj(y)
+            e1 = self.resid_dropout(y_out)
+            
+            return e1, e1
+
+
+        q = q.view(B, 2*T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, 2T, hs)
 
         S = self.bias.shape[3] // 2
 
@@ -232,7 +267,6 @@ class DelayedSelfAttention(nn.Module):
         
         else:
             # manual implementation of attention
-            # IS THIS CORRECT?
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
             att = att.masked_fill(attn_mask == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
@@ -351,10 +385,8 @@ class DelayedBlock(nn.Module):
 class MergingDelayedBlock(nn.Module):
 
     # For "merging" layers (going from delayed layers to standard layers):
-    # it is the exact same as standard Delayed Layers,except do not modify E2
+    # The exact same as standard Delayed Layers,except do not modify E2
     # Only return two copies of E1, but still perform attention with E2
-    # Might need a specific DelayedSelfAttention() for mergine layers to save compute
-    # Or just add a flag to not compute e2
     # Even in a fully delayed attention architecture, the final layer should be a merging layer
 
     def __init__(self, config):
@@ -365,8 +397,7 @@ class MergingDelayedBlock(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, e1, e2):
-        # will add a flag here to not compute e2
-        attn_out1, attn_out2 = self.attn(self.ln_1(e1), self.ln_1(e2))
+        attn_out1, attn_out2 = self.attn(self.ln_1(e1), self.ln_1(e2), compute_e2=False) # Flag to not compute e2
         e1 = e1 + attn_out1
         e1 = e1 + self.mlp(self.ln_2(e1))
         return e1, e1
@@ -389,7 +420,7 @@ class GPTConfig:
     overlap: int = 15
 
     lora_rank: int = 16
-    lora_alpha: int = 32  # LoRA scaling factor (usually 2x rank)
+    lora_alpha: int = 32  # LoRA scaling factor (common to be 2x rank)
 
 
 class GPT(nn.Module):
@@ -436,6 +467,10 @@ class GPT(nn.Module):
 
         # init all weights
         self.apply(self._init_weights)
+
+        for key in self.transformer.wete:
+            nn.init.zeros_(self.transformer.wete[key].weight) # initialize enbedding-type encodings with zeros
+
         # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
