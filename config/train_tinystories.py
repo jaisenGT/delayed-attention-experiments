@@ -12,7 +12,7 @@ wandb_log = True # highly recommended to visualize the loss divergence
 wandb_project = 'tinystories-delayed'
 wandb_run_name = 'delayed-30m'
 
-dataset = 'tinystories'
+dataset = 'shakespeare' # CHANGE THIS
 gradient_accumulation_steps = 2 # simulate larger batch size
 batch_size = 64
 block_size = 512 # 256 is too short for a story. 512 gives E2 room to work.
