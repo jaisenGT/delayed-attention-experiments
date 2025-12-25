@@ -28,8 +28,10 @@ dropout = 0.2
 
 # delayed attention parameters
 delayed_layers = [0, 1, 2]
-lookahead = 4
+lookahead = 3
 overlap = 15
+lora_rank = 4
+lora_alpha = 8
 
 
 
