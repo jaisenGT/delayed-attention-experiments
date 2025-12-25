@@ -61,6 +61,9 @@ delayed_layers = [] # default to empty (standard GPT)
 lookahead = 30
 overlap = 15
 
+lora_rank = 4
+lora_alpha = 8
+
 
 
 
@@ -154,8 +157,8 @@ if os.path.exists(meta_path):
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
 # model init
-model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size, bias=bias, vocab_size=None,
-                  dropout=dropout, delayed_layers=delayed_layers, lookahead=lookahead, overlap=overlap) # start with model_args from command line
+model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size, bias=bias, vocab_size=None, dropout=dropout,
+                  delayed_layers=delayed_layers, lookahead=lookahead, overlap=overlap, lora_rank=lora_rank, lora_alpha=lora_alpha) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
