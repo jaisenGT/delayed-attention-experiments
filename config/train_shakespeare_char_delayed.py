@@ -28,7 +28,7 @@ dropout = 0.2
 
 # delayed attention parameters
 delayed_layers = [0, 1, 2]
-lookahead = 10
+lookahead = 4
 overlap = 15
 
 
