@@ -418,8 +418,8 @@ class GPTConfig:
     lookahead: int = 30
     overlap: int = 15
 
-    lora_rank: int = 16
-    lora_alpha: int = 32  # LoRA scaling factor (common to be 2x rank)
+    lora_rank: int = 4
+    lora_alpha: int = 8  # LoRA scaling factor (common to be 2x rank)
 
 
 class GPT(nn.Module):
