@@ -1,18 +1,18 @@
-# train_tinystories_delayed.py
+# train_tinystories_standard.py
 
-out_dir = 'out-tinystories-delayed'
-eval_interval = 500
-eval_iters = 200
+out_dir = 'out-tinystories-standard'
+eval_interval = 200
+eval_iters = 100
 log_interval = 10
 
 # save checkpoints so we can generate stories later to check coherence
 always_save_checkpoint = True
 
 wandb_log = True # highly recommended to visualize the loss divergence
-wandb_project = 'tinystories-delayed'
-wandb_run_name = 'delayed-30m'
+wandb_project = 'tinystories'
+wandb_run_name = 'standard-25m'
 
-dataset = 'shakespeare' # CHANGE THIS
+dataset = 'tinystories'
 gradient_accumulation_steps = 2 # simulate larger batch size
 batch_size = 64
 block_size = 512 # 256 is too short for a story. 512 gives E2 room to work.
