@@ -8,17 +8,17 @@ log_interval = 10
 # save checkpoints so we can generate stories later to check coherence
 always_save_checkpoint = True
 
-wandb_log = True # highly recommended to visualize the loss divergence
+wandb_log = True
 wandb_project = 'tinystories'
 wandb_run_name = 'standard-25m'
 
 dataset = 'tinystories'
 gradient_accumulation_steps = 2 # simulate larger batch size
 batch_size = 64
-block_size = 512 # 256 is too short for a story. 512 gives E2 room to work.
+block_size = 512 # 512 gives E2 room to work.
 
-# Model: ~28M Parameters
-# (Standard TinyStories sizes: 1M, 3M, 33M. We target the 33M tier)
+# Model: ~25M Parameters
+# (Standard TinyStories sizes: 1M, 3M, 33M.)
 n_layer = 8
 n_head = 8
 n_embd = 512
@@ -28,8 +28,8 @@ dropout = 0.1 # TinyStories is large enough that we don't need heavy dropout
 delayed_layers = []
 
 # Optimization
-learning_rate = 5e-4 # Lower LR for larger model
-max_iters = 10000 # TinyStories needs more iters than shakespeare
+learning_rate = 5e-4
+max_iters = 10000
 lr_decay_iters = 10000
 min_lr = 5e-5 
 beta2 = 0.99
@@ -38,4 +38,4 @@ warmup_iters = 200
 weight_decay = 1e-1
 
 device = 'cuda' # or 'cpu' / 'mps'
-compile = True # definitely use compile for this size if possible
+compile = True # good for A100 GPUs

@@ -4,6 +4,7 @@ Additions:
 1. Embedding-type encodings
 2. Overlap
 3. LoRA heads for MLP and projection matrices for E2 embeddings
+4. Weighted auxillary loss (E2 predicts token i + lookahead + 1)
 
 
 Left to do:
@@ -16,8 +17,7 @@ Left to do:
     QK normalization
 3. Cascade Attention
 4. Estimate_flops function (can track memory empirically)
-5. Auxillary loss (make E2 predict something, like token i + lookahead + 1), make it not as important as main E1 next-token loss
-6. Separate trained encodings for E1 and E2 from the start --> only works if the first layer is delayed
+5. Separate trained encodings for E1 and E2 from the start --> only works if the first layer is delayed
 
 
 General GPT improvements (might move to nanoChat for this):
@@ -421,6 +421,8 @@ class GPTConfig:
     lora_rank: int = 4
     lora_alpha: int = 8  # LoRA scaling factor (common to be 2x rank)
 
+    aux_loss_weight: float = 0.3
+
 
 class GPT(nn.Module):
 
@@ -430,12 +432,14 @@ class GPT(nn.Module):
         assert config.block_size is not None
         self.config = config
 
+        self.config.delayed_layers = [x for x in self.config.delayed_layers if x >= 0 and x < self.config.n_layer - 1]
+
         layers = []
         embed_type_encod = {} # initialize embedding-type encodings as empty dict
 
         for i in range(config.n_layer):
 
-            if i in config.delayed_layers and not i == config.n_layer - 1:
+            if i in config.delayed_layers:
 
                 layers.append(DelayedBlock(config))
 
@@ -455,20 +459,34 @@ class GPT(nn.Module):
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList(layers),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
+            ln_f_e2 = LayerNorm(config.n_embd, bias=config.bias),
         ))
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+        self.lm_head_e2 = nn.Linear(config.n_embd, config.vocab_size, bias=False) # Auxillary loss
+
+        self.lookahead = self.config.lookahead
+
+        if len(self.config.delayed_layers) > 0: self.last_delayed_layer_index = max(self.config.delayed_layers)
+        else: self.last_delayed_layer_index = None
+
+
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
+        self.lm_head_e2.weight = self.transformer.wte.weight # weight trying for auxillary loss
+
+
         # init all weights
         self.apply(self._init_weights)
 
-        # for key in self.transformer.wete:
-        #     nn.init.zeros_(self.transformer.wete[key].weight) # initialize enbedding-type encodings with zeros
+        # Might want to comment out this:
+        for key in self.transformer.wete:
+            nn.init.zeros_(self.transformer.wete[key].weight) # initialize enbedding-type encodings with zeros
 
         # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
@@ -477,6 +495,8 @@ class GPT(nn.Module):
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+
+
 
     def get_num_params(self, non_embedding=True):
         """
@@ -490,6 +510,8 @@ class GPT(nn.Module):
             n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
+
+
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
@@ -498,7 +520,9 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+
+
+    def forward(self, idx, targets=None, ignore_aux_loss=False):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -511,6 +535,8 @@ class GPT(nn.Module):
         e1 = self.transformer.drop(tok_emb + pos_emb)
         e2 = e1
 
+        e2_for_aux_loss = None
+
         for i, block in enumerate(self.transformer.h):
 
             # add embedding-type encodings here
@@ -522,19 +548,47 @@ class GPT(nn.Module):
 
             e1, e2 = block(e1, e2)
 
+            if self.last_delayed_layer_index == i:
+                e2_for_aux_loss = self.transformer.ln_f_e2(e2) # e2 auxillary loss
+
 
         x = self.transformer.ln_f(e1)
+
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            loss_main = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+
+            loss_aux = torch.tensor(0.0, device=device)
+            
+            # Auxiliary Loss
+            if e2_for_aux_loss is not None and not ignore_aux_loss:
+                # Shift targets (lookahead + 1)
+                lookahead = self.config.lookahead
+                valid_len = targets.size(1) - lookahead
+                
+                if valid_len > 0:
+                    e2_cropped = e2_for_aux_loss[:, :valid_len, :].contiguous()
+                    valid_logits = self.lm_head_e2(e2_cropped)                    
+                    valid_targets = targets[:, lookahead:].contiguous()
+                    loss_aux = F.cross_entropy(
+                        valid_logits.view(-1, valid_logits.size(-1)), 
+                        valid_targets.view(-1), 
+                        ignore_index=-1
+                    )
+
+            loss = loss_main + (self.config.aux_loss_weight * loss_aux)
+
+
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
         return logits, loss
+
+
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
