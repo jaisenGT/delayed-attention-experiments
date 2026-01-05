@@ -40,4 +40,4 @@ python train.py --config=config/train_tinystories_delayed.py
 ```
 
 
-**Acknowledgements:** Andrej Karpathy for the [nanoGPT](https://github.com/karpathy/nanoGPT) codebase and TinyStories for the primary dataset used in these experiments.
+**Acknowledgements:** Andrej Karpathy for the [nanoGPT](https://github.com/karpathy/nanoGPT) codebase, which was the foundation for this project, and TinyStories for the primary dataset used in these experiments.
