@@ -29,6 +29,10 @@ Further research can be done to scale up delayed attention models to see if thei
 To reproduce these results or experiment with the Delayed Attention architecture:
 
 ```
+# Clone the repository
+git clone https://github.com/jaisenGT/delayed-attention-experiments.git
+cd delayed-attention-experiments
+
 # Install dependencies
 pip install torch numpy transformers datasets tiktoken wandb tqdm
 
@@ -36,7 +40,10 @@ pip install torch numpy transformers datasets tiktoken wandb tqdm
 python data/tinystories/prepare.py
 
 # Train the Delayed Attention model
-python train.py --config=config/train_tinystories_delayed.py
+python train.py config/train_tinystories_delayed.py
+
+# Generate text (Inference)
+python sample.py --out_dir=out-tinystories-delayed --start="Once upon a time"
 ```
 
 
